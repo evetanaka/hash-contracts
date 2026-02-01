@@ -8,6 +8,7 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "./HashToken.sol";
 import "./HashStaking.sol";
+import "./HashJackpot.sol";
 
 /**
  * @title HashGame
@@ -37,9 +38,10 @@ contract HashGame is ReentrancyGuard, Pausable, Ownable {
 
     // ============ Constants ============
 
-    uint256 public constant BLOCKS_TO_WAIT = 2;      // Bet on block N+2
+    uint256 public constant BLOCKS_TO_WAIT = 10;     // Bet on block N+10 (safer)
     uint256 public constant MAX_BLOCK_AGE = 256;     // Blockhash available for 256 blocks
     uint256 public constant BPS_DENOMINATOR = 10000;
+    uint256 public constant MIN_BET = 1e18;          // Minimum 1 token
     
     // Revenue distribution (in basis points)
     uint256 public constant BURN_BPS = 4000;         // 40%
@@ -61,21 +63,20 @@ contract HashGame is ReentrancyGuard, Pausable, Ownable {
 
     HashToken public immutable hashToken;
     HashStaking public immutable staking;
+    HashJackpot public immutable jackpot;
     
     address public treasury;
     
     mapping(uint256 => Bet) public bets;
     uint256 public nextBetId;
     
-    // Jackpot
-    uint256 public jackpotPool;
+    // Streak tracking
     mapping(address => uint8) public currentStreak;
     mapping(address => GameMode) public streakMode;
     
     // Stats
     uint256 public totalVolume;
     uint256 public totalBurned;
-    uint256 public totalJackpotPaid;
     
     // Price feed (simplified - in production use Chainlink)
     uint256 public tokenPriceUsd = 1e7;  // Default $0.10 per token (scaled by 1e8)
@@ -105,8 +106,6 @@ contract HashGame is ReentrancyGuard, Pausable, Ownable {
         uint256 amount
     );
     
-    event JackpotWon(address indexed winner, uint256 amount);
-    
     event RevenueDistributed(
         uint256 burned,
         uint256 toJackpot,
@@ -115,19 +114,25 @@ contract HashGame is ReentrancyGuard, Pausable, Ownable {
         uint256 toReferrer
     );
 
+    event TokenPriceUpdated(uint256 oldPrice, uint256 newPrice);
+    event TreasuryUpdated(address oldTreasury, address newTreasury);
+
     // ============ Constructor ============
 
     constructor(
         address _hashToken,
         address _staking,
+        address _jackpot,
         address _treasury
     ) Ownable(msg.sender) {
         require(_hashToken != address(0), "Invalid token");
         require(_staking != address(0), "Invalid staking");
+        require(_jackpot != address(0), "Invalid jackpot");
         require(_treasury != address(0), "Invalid treasury");
         
         hashToken = HashToken(_hashToken);
         staking = HashStaking(_staking);
+        jackpot = HashJackpot(_jackpot);
         treasury = _treasury;
     }
 
@@ -144,6 +149,8 @@ contract HashGame is ReentrancyGuard, Pausable, Ownable {
         uint16 prediction,
         uint256 amount
     ) external nonReentrant whenNotPaused returns (uint256 betId) {
+        require(amount >= MIN_BET, "Below minimum bet");
+        
         // Validate prediction range
         _validatePrediction(mode, prediction);
         
@@ -151,7 +158,6 @@ contract HashGame is ReentrancyGuard, Pausable, Ownable {
         (,, uint256 maxBetUsd,) = staking.getUserTierInfo(msg.sender);
         uint256 maxBetTokens = (maxBetUsd * 1e18) / tokenPriceUsd;
         require(amount <= maxBetTokens, "Exceeds max bet for tier");
-        require(amount > 0, "Amount must be > 0");
         
         // Transfer tokens
         IERC20(address(hashToken)).safeTransferFrom(msg.sender, address(this), amount);
@@ -189,9 +195,14 @@ contract HashGame is ReentrancyGuard, Pausable, Ownable {
         // Check if expired
         if (block.number > bet.targetBlock + MAX_BLOCK_AGE) {
             bet.status = BetStatus.EXPIRED;
-            // Refund on expiry
-            IERC20(address(hashToken)).safeTransfer(bet.player, bet.amount);
-            emit BetResolved(betId, bet.player, false, 0, bet.amount);
+            // Refund on expiry minus small fee
+            uint256 expiryFee = bet.amount / 100;  // 1% expiry fee
+            uint256 refund = bet.amount - expiryFee;
+            
+            IERC20(address(hashToken)).safeTransfer(bet.player, refund);
+            IERC20(address(hashToken)).safeTransfer(treasury, expiryFee);
+            
+            emit BetResolved(betId, bet.player, false, 0, refund);
             return;
         }
         
@@ -313,15 +324,29 @@ contract HashGame is ReentrancyGuard, Pausable, Ownable {
         return (currentStreak[player], streakMode[player]);
     }
 
+    /**
+     * @notice Get game stats
+     */
+    function getStats() external view returns (
+        uint256 volume,
+        uint256 burned,
+        uint256 jackpotPot,
+        uint256 betsCount
+    ) {
+        return (totalVolume, totalBurned, jackpot.currentPot(), nextBetId);
+    }
+
     // ============ Admin Functions ============
 
     function setTokenPrice(uint256 newPrice) external onlyOwner {
         require(newPrice > 0, "Invalid price");
+        emit TokenPriceUpdated(tokenPriceUsd, newPrice);
         tokenPriceUsd = newPrice;
     }
 
     function setTreasury(address newTreasury) external onlyOwner {
         require(newTreasury != address(0), "Invalid treasury");
+        emit TreasuryUpdated(treasury, newTreasury);
         treasury = newTreasury;
     }
 
@@ -400,9 +425,10 @@ contract HashGame is ReentrancyGuard, Pausable, Ownable {
             currentStreak[bet.player]++;
         }
         
-        // Check for jackpot
+        // Check for jackpot (5 consecutive wins)
         if (currentStreak[bet.player] >= JACKPOT_STREAK) {
-            _awardJackpot(bet.player);
+            currentStreak[bet.player] = 0;  // Reset streak
+            jackpot.awardStreakWinner(bet.player);
         }
         
         // Note: Payout not transferred here - player must call cashOut() or rideWinnings()
@@ -426,7 +452,7 @@ contract HashGame is ReentrancyGuard, Pausable, Ownable {
         uint256 extraToStakers = 0;
         
         if (referrer != address(0)) {
-            (, uint16 boostBps,, uint16 referralFeeBps) = staking.getUserTierInfo(referrer);
+            (,,, uint16 referralFeeBps) = staking.getUserTierInfo(referrer);
             referralAmount = (revenue * referralFeeBps) / BPS_DENOMINATOR;
             extraToStakers = (revenue * REFERRAL_MAX_BPS) / BPS_DENOMINATOR - referralAmount;
         } else {
@@ -441,8 +467,9 @@ contract HashGame is ReentrancyGuard, Pausable, Ownable {
         hashToken.burnFromGame(address(this), burnAmount);
         totalBurned += burnAmount;
         
-        // Jackpot
-        jackpotPool += jackpotAmount;
+        // Jackpot - send to jackpot contract
+        IERC20(address(hashToken)).approve(address(jackpot), jackpotAmount);
+        jackpot.feed(jackpotAmount);
         
         // Infrastructure
         IERC20(address(hashToken)).safeTransfer(treasury, infraAmount);
@@ -457,17 +484,5 @@ contract HashGame is ReentrancyGuard, Pausable, Ownable {
         }
         
         emit RevenueDistributed(burnAmount, jackpotAmount, stakersAmount, infraAmount, referralAmount);
-    }
-
-    function _awardJackpot(address winner) internal {
-        uint256 prize = jackpotPool;
-        jackpotPool = 0;
-        currentStreak[winner] = 0;
-        
-        totalJackpotPaid += prize;
-        
-        IERC20(address(hashToken)).safeTransfer(winner, prize);
-        
-        emit JackpotWon(winner, prize);
     }
 }

@@ -4,14 +4,20 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+
+interface IHashJackpot {
+    function registerStaker(address staker) external;
+    function removeStaker(address staker) external;
+}
 
 /**
  * @title HashStaking
  * @notice Stake $HASH tokens for tier benefits and revenue share
- * @dev 12-month lock period, 5 tiers with increasing benefits
+ * @dev 12-month lock period with emergency exit, 5 tiers with increasing benefits
  */
-contract HashStaking is ReentrancyGuard, Ownable {
+contract HashStaking is ReentrancyGuard, Pausable, Ownable {
     using SafeERC20 for IERC20;
 
     // ============ Structs ============
@@ -35,10 +41,13 @@ contract HashStaking is ReentrancyGuard, Ownable {
 
     uint256 public constant LOCK_DURATION = 365 days;
     uint256 public constant BPS_DENOMINATOR = 10000;
+    uint256 public constant EMERGENCY_PENALTY_BPS = 5000;  // 50% penalty for early exit
+    uint256 public constant MAX_STAKE_PER_USER = 5_000_000 * 1e18;  // 5M max per user
 
     // ============ State ============
 
     IERC20 public immutable hashToken;
+    IHashJackpot public jackpot;
     
     mapping(address => Stake) public stakes;
     mapping(address => address) public referrers;  // user => referrer
@@ -54,9 +63,11 @@ contract HashStaking is ReentrancyGuard, Ownable {
     event Staked(address indexed user, uint256 amount, uint256 lockEnd);
     event StakeAdded(address indexed user, uint256 amount, uint256 newLockEnd);
     event Unstaked(address indexed user, uint256 amount);
+    event EmergencyUnstaked(address indexed user, uint256 amount, uint256 penalty);
     event RewardsClaimed(address indexed user, uint256 amount);
     event RewardsDistributed(uint256 amount);
     event ReferrerSet(address indexed user, address indexed referrer);
+    event JackpotSet(address indexed jackpot);
 
     // ============ Constructor ============
 
@@ -113,9 +124,10 @@ contract HashStaking is ReentrancyGuard, Ownable {
      * @param amount Amount of tokens to stake
      * @param referrer Optional referrer address
      */
-    function stake(uint256 amount, address referrer) external nonReentrant {
+    function stake(uint256 amount, address referrer) external nonReentrant whenNotPaused {
         require(amount > 0, "Amount must be > 0");
         require(stakes[msg.sender].amount == 0, "Already staking, use addToStake");
+        require(amount <= MAX_STAKE_PER_USER, "Exceeds max stake per user");
         
         // Set referrer if provided and not already set
         if (referrer != address(0) && referrers[msg.sender] == address(0) && referrer != msg.sender) {
@@ -135,6 +147,11 @@ contract HashStaking is ReentrancyGuard, Ownable {
         
         totalStaked += amount;
         
+        // Register for jackpot lottery
+        if (address(jackpot) != address(0)) {
+            jackpot.registerStaker(msg.sender);
+        }
+        
         emit Staked(msg.sender, amount, block.timestamp + LOCK_DURATION);
     }
 
@@ -142,16 +159,18 @@ contract HashStaking is ReentrancyGuard, Ownable {
      * @notice Add more tokens to existing stake (resets lock period)
      * @param amount Amount to add
      */
-    function addToStake(uint256 amount) external nonReentrant {
+    function addToStake(uint256 amount) external nonReentrant whenNotPaused {
         require(amount > 0, "Amount must be > 0");
         require(stakes[msg.sender].amount > 0, "No existing stake");
+        
+        Stake storage s = stakes[msg.sender];
+        require(s.amount + amount <= MAX_STAKE_PER_USER, "Exceeds max stake per user");
         
         // Claim pending rewards first
         _claimRewards(msg.sender);
         
         hashToken.safeTransferFrom(msg.sender, address(this), amount);
         
-        Stake storage s = stakes[msg.sender];
         s.amount += amount;
         s.lockStart = block.timestamp;
         s.lockEnd = block.timestamp + LOCK_DURATION;
@@ -176,11 +195,54 @@ contract HashStaking is ReentrancyGuard, Ownable {
         uint256 amount = s.amount;
         totalStaked -= amount;
         
+        // Remove from jackpot lottery
+        if (address(jackpot) != address(0)) {
+            jackpot.removeStaker(msg.sender);
+        }
+        
         delete stakes[msg.sender];
         
         hashToken.safeTransfer(msg.sender, amount);
         
         emit Unstaked(msg.sender, amount);
+    }
+
+    /**
+     * @notice Emergency unstake with 50% penalty (before lock expires)
+     */
+    function emergencyUnstake() external nonReentrant {
+        Stake storage s = stakes[msg.sender];
+        require(s.amount > 0, "No stake");
+        require(block.timestamp < s.lockEnd, "Lock expired, use normal unstake");
+        
+        // Claim pending rewards first
+        _claimRewards(msg.sender);
+        
+        uint256 amount = s.amount;
+        uint256 penalty = (amount * EMERGENCY_PENALTY_BPS) / BPS_DENOMINATOR;
+        uint256 refund = amount - penalty;
+        
+        totalStaked -= amount;
+        
+        // Remove from jackpot lottery
+        if (address(jackpot) != address(0)) {
+            jackpot.removeStaker(msg.sender);
+        }
+        
+        delete stakes[msg.sender];
+        
+        // Penalty goes to other stakers
+        if (totalStaked > 0) {
+            accRewardPerShare += (penalty * 1e12) / totalStaked;
+            rewardPool += penalty;
+        } else {
+            // No other stakers, burn the penalty
+            // Note: Would need burn function, for now send to contract
+        }
+        
+        hashToken.safeTransfer(msg.sender, refund);
+        
+        emit EmergencyUnstaked(msg.sender, refund, penalty);
     }
 
     /**
@@ -196,7 +258,12 @@ contract HashStaking is ReentrancyGuard, Ownable {
      */
     function distributeRewards(uint256 amount) external {
         require(amount > 0, "Amount must be > 0");
-        require(totalStaked > 0, "No stakers");
+        
+        if (totalStaked == 0) {
+            // No stakers, send to owner as fallback
+            hashToken.safeTransferFrom(msg.sender, owner(), amount);
+            return;
+        }
         
         hashToken.safeTransferFrom(msg.sender, address(this), amount);
         
@@ -275,6 +342,75 @@ contract HashStaking is ReentrancyGuard, Ownable {
         lockEnd = s.lockEnd;
         isLocked = block.timestamp < s.lockEnd;
         daysRemaining = isLocked ? (s.lockEnd - block.timestamp) / 1 days : 0;
+    }
+
+    /**
+     * @notice Get global staking stats
+     */
+    function getGlobalStats() external view returns (
+        uint256 _totalStaked,
+        uint256 _rewardPool,
+        uint256 _accRewardPerShare
+    ) {
+        return (totalStaked, rewardPool, accRewardPerShare);
+    }
+
+    // ============ Admin Functions ============
+
+    /**
+     * @notice Set jackpot contract address
+     * @param _jackpot Jackpot contract address
+     */
+    function setJackpot(address _jackpot) external onlyOwner {
+        require(_jackpot != address(0), "Invalid jackpot");
+        jackpot = IHashJackpot(_jackpot);
+        emit JackpotSet(_jackpot);
+    }
+
+    /**
+     * @notice Update tier configuration
+     * @param tierIndex Tier to update (0-4)
+     * @param minStake Minimum stake for tier
+     * @param boostBps Boost in basis points
+     * @param maxBetUsd Max bet in USD (scaled by 1e8)
+     * @param referralFeeBps Referral fee in basis points
+     */
+    function setTier(
+        uint8 tierIndex,
+        uint256 minStake,
+        uint16 boostBps,
+        uint256 maxBetUsd,
+        uint16 referralFeeBps
+    ) external onlyOwner {
+        require(tierIndex < 5, "Invalid tier");
+        require(boostBps <= 5000, "Boost too high");  // Max 50%
+        require(referralFeeBps <= 1000, "Referral fee too high");  // Max 10%
+        
+        tiers[tierIndex] = Tier({
+            minStake: minStake,
+            boostBps: boostBps,
+            maxBetUsd: maxBetUsd,
+            referralFeeBps: referralFeeBps
+        });
+    }
+
+    /**
+     * @notice Admin function to reset referrer (for disputes)
+     * @param user User to reset
+     * @param newReferrer New referrer (can be zero)
+     */
+    function adminSetReferrer(address user, address newReferrer) external onlyOwner {
+        require(user != newReferrer, "Cannot self-refer");
+        referrers[user] = newReferrer;
+        emit ReferrerSet(user, newReferrer);
+    }
+
+    function pause() external onlyOwner {
+        _pause();
+    }
+
+    function unpause() external onlyOwner {
+        _unpause();
     }
 
     // ============ Internal Functions ============
