@@ -38,7 +38,7 @@ contract HashGame is ReentrancyGuard, Pausable, Ownable {
 
     // ============ Constants ============
 
-    uint256 public constant BLOCKS_TO_WAIT = 10;     // Bet on block N+10 (safer)
+    uint256 public constant BLOCKS_TO_WAIT = 2;      // Bet on block N+2 (fast UX)
     uint256 public constant MAX_BLOCK_AGE = 256;     // Blockhash available for 256 blocks
     uint256 public constant BPS_DENOMINATOR = 10000;
     uint256 public constant MIN_BET = 1e18;          // Minimum 1 token
